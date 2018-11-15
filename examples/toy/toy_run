@@ -1,0 +1,17 @@
+rm rank_logging/*
+rm logs/*
+python -m torch.distributed.launch \
+--nproc_per_node=1 toy.py  \
+--batch-size 1024 \
+--input-size 1024 \
+--hidden-size 1024 \
+--output-size 1024 \
+--hidden-layers 5 \
+--iteration-number 100 \
+--warmup-number 30  \
+--layers-per-bucket 1 \
+--debug-apex \
+--logging  \
+--logdir /home/scratch.shawnw_gpu/docker/apex/examples/toy/rank_logging
+#QdstrmImporte logs/export_nsys_toy.qdstrm
+

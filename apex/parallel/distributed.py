@@ -13,6 +13,9 @@ from torch.autograd import Variable
 from collections import OrderedDict
 from itertools import chain
 import copy
+import logging 
+import time
+import pprint
 
 # apply_dist_call requires that tensors in 'bucket' are all the same type.
 def apply_flat_dist_call(bucket, call, extra_args=None):
@@ -180,6 +183,7 @@ class DistributedDataParallel(Module):
         self.allreduce_always_fp32 = allreduce_always_fp32
         self.gradient_average = gradient_average
         self.gradient_predivide_factor = gradient_predivide_factor
+        self.iteration_idx = -1
 
         self.custom_allreduce_triggers = False
         if allreduce_trigger_params is not None:
@@ -192,10 +196,16 @@ class DistributedDataParallel(Module):
         self.message_size = message_size
 
         self.reduction_stream = torch.cuda.Stream()
-        self.reduction_event = torch.cuda.Event(enable_timing=False, blocking=False) 
+        self.reduction_event = torch.cuda.Event(enable_timing=True, blocking=False) 
+        self.compute_event = torch.cuda.Event(enable_timing=True, blocking=False)
         
         self.module = module
-        
+
+        #timing events
+        self.fwd_start_event = torch.cuda.Event(enable_timing = True, blocking = False)
+        self.fwd_end_event   = torch.cuda.Event(enable_timing = True, blocking = False)
+        self.bwd_end_event   = torch.cuda.Event(enable_timing = True, blocking = False)
+
         if self._backend == self.backend_enum_holder.NCCL:
             for param in self.module.parameters():
                 assert param.is_cuda, "NCCL backend only supports model parameters to be on GPU."
@@ -240,6 +250,7 @@ class DistributedDataParallel(Module):
                                            list(chain(*self.active_i_buckets)))
 
         dist.broadcast(info_tensor, 0)
+        #logging.debug("training barrier time;%s", time.time())
 
         info = [int(entry) for entry in info_tensor]
 
@@ -276,11 +287,13 @@ class DistributedDataParallel(Module):
                     self.needs_refresh = False
 
             self.allreduce_fallback()
-
+            torch.cuda.current_stream().record_event(self.bwd_end_event)
 
         def overlapping_backward_epilogue():
+            torch.cuda.current_stream().record_event(self.bwd_end_event)
             self.reduction_stream.record_event(self.reduction_event)
             torch.cuda.current_stream().wait_event(self.reduction_event)
+            #logging.debug("epilog_time;%s;%s", self.iteration_idx, epilog_time/1000)
      
             # Sanity checks that all the buckets were kicked off
             if self.next_bucket != self.num_buckets:
@@ -355,118 +368,145 @@ class DistributedDataParallel(Module):
         if self.gradient_predivide_factor != 1.0:
             tensor_to_allreduce.mul_(1./self.gradient_predivide_factor)
 
+
         dist.all_reduce(tensor_to_allreduce)
+        
+        
 
         if self.gradient_average:
             tensor_to_allreduce.mul_(self.gradient_predivide_factor/self.world_size)
 
         if self.allreduce_always_fp32 and tensor is not tensor_to_allreduce:
             tensor.copy_(tensor_to_allreduce)
- 
         return tensor
     
-
     def allreduce_maybe_retain(self, bucket, bucket_idx=-1):
-        allreduced = self.allreduce_bucket(bucket)
-        if self.retain_allreduce_buffers:
-            if self.allreduce_buffers[bucket_idx] is not None:
-                raise RuntimeError("The backward pass is attempting to replace an already-filled "
-                                   "allreduce buffer.  This is almost certainly an error.")
-            self.allreduce_buffers[bucket_idx] = allreduced
-        else:
-            for buf, synced in zip(bucket, unflatten(allreduced, bucket)):
-                buf.copy_(synced)
-
-
+      start_event = torch.cuda.Event(enable_timing=True, blocking=False) 
+      end_event = torch.cuda.Event(enable_timing=True, blocking=False) 
+      self.nccl_allreduce_start_event.append(start_event)
+      self.nccl_allreduce_end_event.append(end_event)
+      self.reduction_stream.record_event(start_event)
+      #logging.debug("bucket_reduce;%s;%s", bucket_idx, time.time())
+      allreduced = self.allreduce_bucket(bucket)
+      if self.retain_allreduce_buffers:
+        if self.allreduce_buffers[bucket_idx] is not None:
+          raise RuntimeError("The backward pass is attempting to replace an already-filled "
+                             "allreduce buffer.  This is almost certainly an error.")
+        self.allreduce_buffers[bucket_idx] = allreduced
+      else:
+        for buf, synced in zip(bucket, unflatten(allreduced, bucket)):
+          buf.copy_(synced)
+          
+      self.reduction_stream.record_event(end_event)
+          
+      
+      
     def allreduce_fallback(self):
-        grads = [param.grad.data for param in self.module.parameters() if param.grad is not None]
+      grads = [param.grad.data for param in self.module.parameters() if param.grad is not None]
 
-        split_buckets = split_half_float_double(grads)
+      split_buckets = split_half_float_double(grads)
 
-        # If retain_allreduce_buffers is True and delay_allreduce is False,
-        # this will only be done during the first backward pass, ignored by the 
-        # training script, and overwritten in the next forward pass.  So it's harmless. 
-        if self.retain_allreduce_buffers:
-            self.allreduce_buffers = [None for _ in range(len(split_buckets))]
-        
-        for i, bucket in enumerate(split_buckets):
-            allreduced = self.allreduce_maybe_retain(bucket, i)
-
+      # If retain_allreduce_buffers is True and delay_allreduce is False,
+      # this will only be done during the first backward pass, ignored by the 
+      # training script, and overwritten in the next forward pass.  So it's harmless. 
+      if self.retain_allreduce_buffers:
+        self.allreduce_buffers = [None for _ in range(len(split_buckets))]
+      
+      for i, bucket in enumerate(split_buckets):
+        allreduced = self.allreduce_maybe_retain(bucket, i)
 
     def comm_ready_buckets(self, param):
-        # Need to do this in every hook for compatibility with Ruberry's streaming backward PR.
-        # self.reduction_stream.wait_stream(torch.cuda.current_stream())
+      # Need to do this in every hook for compatibility with Ruberry's streaming backward PR.
+      # self.reduction_stream.wait_stream(torch.cuda.current_stream())
 
-        bucket_idx, bucket_loc = self.param_id_to_bucket[id(param)]
+      bucket_idx, bucket_loc = self.param_id_to_bucket[id(param)]
 
-        if self.buckets[bucket_idx][bucket_loc] is not None:
-            raise RuntimeError("The backward pass is attempting to replace an already-filled "
-                               "bucket slot.  This is almost certainly an error.")
+      if self.buckets[bucket_idx][bucket_loc] is not None:
+          raise RuntimeError("The backward pass is attempting to replace an already-filled "
+                             "bucket slot.  This is almost certainly an error.")
 
-        self.buckets[bucket_idx][bucket_loc] = param.grad.data
-        self.buckets_ready_size[bucket_idx] += 1
+      self.buckets[bucket_idx][bucket_loc] = param.grad.data
+      self.buckets_ready_size[bucket_idx] += 1
 
-        if self.buckets_ready_size[bucket_idx] == self.bucket_sizes[bucket_idx]:
-            if bucket_idx == self.next_bucket:
-                torch.cuda.current_stream().record_event(self.reduction_event)
-                self.reduction_stream.wait_event(self.reduction_event)
-                with torch.cuda.stream(self.reduction_stream):
-                    self.allreduce_maybe_retain(self.buckets[bucket_idx], bucket_idx)
+      if self.buckets_ready_size[bucket_idx] == self.bucket_sizes[bucket_idx]:
+        if bucket_idx == self.next_bucket:
+          torch.cuda.current_stream().record_event(self.reduction_event)
+          self.reduction_stream.wait_event(self.reduction_event)
+          with torch.cuda.stream(self.reduction_stream):
+            self.allreduce_maybe_retain(self.buckets[bucket_idx], bucket_idx)
 
-                    self.next_bucket += 1
+            self.next_bucket += 1
 
-                    # Reversing upstream's logic here, because we constructed our buckets based on
-                    # the order things were received during backward.
-                    if len(self.ready_buckets_not_reduced) > 0:
-                        sorted_todo = sorted(self.ready_buckets_not_reduced)
-                        for i in sorted_todo:
-                            # Nothing can be reduced now
-                            if i > self.next_bucket:
-                                break
-                            elif i == self.next_bucket:
-                                self.allreduce_maybe_retain(self.buckets[i], i)
-                                self.ready_buckets_not_reduced.remove(i)
-                                self.next_bucket += 1 
-                            else:
-                                raise ValueError("i should always be >= next_bucket")
-            else:
-                self.ready_buckets_not_reduced.add(bucket_idx)
+            # Reversing upstream's logic here, because we constructed our buckets based on
+            # the order things were received during backward.
+            if len(self.ready_buckets_not_reduced) > 0:
+              sorted_todo = sorted(self.ready_buckets_not_reduced)
+              for i in sorted_todo:
+                # Nothing can be reduced now
+                if i > self.next_bucket:
+                  break
+                elif i == self.next_bucket:
+                  self.allreduce_maybe_retain(self.buckets[i], i)
+                  self.ready_buckets_not_reduced.remove(i)
+                  self.next_bucket += 1 
+                else:
+                  raise ValueError("i should always be >= next_bucket")
+        else:
+          self.ready_buckets_not_reduced.add(bucket_idx)
 
         
     def forward(self, *inputs, **kwargs):
-        result = self.module(*inputs, **kwargs)
+      self.iteration_idx += 1
+      self.nccl_allreduce_start_event = []
+      self.nccl_allreduce_end_event = []
+
+      torch.cuda.current_stream().record_event(self.fwd_start_event)
+      result = self.module(*inputs, **kwargs)
+      torch.cuda.current_stream().record_event(self.fwd_end_event)
+      
+      if not self.delay_allreduce:
+        param_list = [param for param in self.module.parameters() if param.requires_grad]
+
+        # Conditions under which to refresh self.record
+        # Forward has the authority to set needs_refresh to True, but only allreduce_params
+        # in backward has the authority to set needs_refresh to False.
+        # Parentheses are not necessary for correct order of operations, but make the intent clearer.
+        if ((not self.active_params) or 
+            (len(param_list) != len(self.active_params)) or
+            any([param1 is not param2 for param1, param2 in zip(param_list, self.active_params)])):
+            self.needs_refresh = True
+
+        if self.needs_refresh:
+            self.active_i_buckets = []
+            self.buckets = []
+            self.tmp_buckets = [[], [], []] # [running half, float, double buckets]
+            self.tmp_numels = [0, 0, 0]
+            self.bucket_sizes = []
+            self.param_id_to_active_i = {id(param) : i for i, param in enumerate(param_list)}  
+            self.param_id_to_bucket = {}
+        else:
+            self.buckets = [[None for _ in range(self.bucket_sizes[i])] 
+                            for i in range(self.num_buckets)] 
+            self.buckets_ready_size = [0 for i in range(self.num_buckets)]
+            if(self.retain_allreduce_buffers):
+                self.allreduce_buffers = [None for _ in range(self.num_buckets)]
+            self.next_bucket = 0
+            self.ready_buckets_not_reduced = set()
         
-        if not self.delay_allreduce:
-            param_list = [param for param in self.module.parameters() if param.requires_grad]
+        self.active_params = param_list
 
-            # Conditions under which to refresh self.record
-            # Forward has the authority to set needs_refresh to True, but only allreduce_params
-            # in backward has the authority to set needs_refresh to False.
-            # Parentheses are not necessary for correct order of operations, but make the intent clearer.
-            if ((not self.active_params) or 
-                (len(param_list) != len(self.active_params)) or
-                any([param1 is not param2 for param1, param2 in zip(param_list, self.active_params)])):
-                self.needs_refresh = True
+      self.callback_queued = False
+      return result
 
-            if self.needs_refresh:
-                self.active_i_buckets = []
-                self.buckets = []
-                self.tmp_buckets = [[], [], []] # [running half, float, double buckets]
-                self.tmp_numels = [0, 0, 0]
-                self.bucket_sizes = []
-                self.param_id_to_active_i = {id(param) : i for i, param in enumerate(param_list)}  
-                self.param_id_to_bucket = {}
-            else:
-                self.buckets = [[None for _ in range(self.bucket_sizes[i])] 
-                                for i in range(self.num_buckets)] 
-                self.buckets_ready_size = [0 for i in range(self.num_buckets)]
-                if(self.retain_allreduce_buffers):
-                    self.allreduce_buffers = [None for _ in range(self.num_buckets)]
-                self.next_bucket = 0
-                self.ready_buckets_not_reduced = set()
-            
-            self.active_params = param_list
-
-        self.callback_queued = False
-        
-        return result
+    def timing_log(self):
+      torch.cuda.synchronize()
+      if self.iteration_idx > 0:
+      	forward_time = self.fwd_start_event.elapsed_time(self.fwd_end_event)
+      	for i in range(len(self.nccl_allreduce_start_event)):
+      	  #logging.debug("calculating delay: start_event:%s, end_event:%s", self.nccl_allreduce_start_event[i], self.nccl_allreduce_end_event[i])
+      	  temp_time = self.nccl_allreduce_start_event[i].elapsed_time(self.nccl_allreduce_end_event[i])
+      	  logging.debug("bucket_reduce;%s;%s", i, temp_time)
+      	compute_time = self.fwd_start_event.elapsed_time(self.bwd_end_event)
+      	epilog_time = self.bwd_end_event.elapsed_time(self.nccl_allreduce_end_event[-1])
+      	logging.debug("fwd-compute-epilog;%s;%s;%s;%s;%s", self.iteration_idx,forward_time, compute_time, epilog_time, compute_time/(compute_time+epilog_time))        
+      
